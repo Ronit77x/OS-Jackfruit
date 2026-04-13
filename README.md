@@ -1,6 +1,3 @@
-Here is a **clean, professional, submission-ready README** (no emojis, well-structured, and aligned with your final implementation). You can copy-paste this directly.
-
----
 
 # Supervised Multi-Container Runtime with Kernel Memory Monitor
 
