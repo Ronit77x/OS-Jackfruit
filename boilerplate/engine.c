@@ -62,7 +62,7 @@ void write_log_to_file(const char *container_id, const char *msg)
 #define DEFAULT_HARD_LIMIT (64UL << 20)
 
 #define MAX_CONTAINERS 32
-
+char child_stack[STACK_SIZE];
 typedef struct {
     char id[64];
     pid_t pid;
@@ -379,8 +379,25 @@ void *logging_thread(void *arg)
 // ================= CHILD FUNCTION =================
 int child_fn(void *arg)
 {
-    (void)arg;
-    return 1;
+    control_request_t *req = (control_request_t *)arg;
+
+    printf("👶 Container started (PID namespace)\n");
+
+    // 🔹 Hostname isolation
+    sethostname(req->container_id, strlen(req->container_id));
+
+    // 🔹 Filesystem isolation
+    if (chroot(req->rootfs) != 0) {
+        perror("chroot failed");
+        exit(1);
+    }
+    chdir("/");
+
+    // 🔹 Execute command
+    execl(req->command, req->command, NULL);
+
+    perror("exec failed");
+    exit(1);
 }
 int register_with_monitor(int monitor_fd,
                           const char *container_id,
@@ -444,158 +461,176 @@ signal(SIGCHLD, handle_sigchld);
 
     printf("Supervisor listening on %s\n", CONTROL_PATH);
 
-    while (1) {
-        int client_fd;
-        control_request_t req;
+while (1) {
+    int client_fd;
+    control_request_t req;
+    control_response_t res;
 
-        client_fd = accept(ctx.server_fd, NULL, NULL);
-        if (client_fd < 0) continue;
+    client_fd = accept(ctx.server_fd, NULL, NULL);
+    if (client_fd < 0) continue;
 
-        memset(&req, 0, sizeof(req));
+    memset(&req, 0, sizeof(req));
+    memset(&res, 0, sizeof(res));
 
-        if (read(client_fd, &req, sizeof(req)) <= 0) {
+    if (read(client_fd, &req, sizeof(req)) <= 0) {
+        close(client_fd);
+        continue;
+    }
+
+    printf("Received request: kind=%d id=%s\n",
+           req.kind, req.container_id);
+
+    // ===== RUN / START =====
+    if (req.kind == CMD_RUN || req.kind == CMD_START) {
+
+        int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS;
+
+        control_request_t *child_req = malloc(sizeof(control_request_t));
+        if (!child_req) {
+            perror("malloc failed");
+            res.status = -1;
+            strcpy(res.message, "malloc failed");
+            write(client_fd, &res, sizeof(res));
             close(client_fd);
             continue;
         }
 
-        printf("Received request: kind=%d id=%s\n",
-               req.kind, req.container_id);
+        *child_req = req;
 
-        // ===== RUN / START =====
-        if (req.kind == CMD_RUN || req.kind == CMD_START) {
+        pid_t pid = clone(child_fn,
+                          child_stack + STACK_SIZE,
+                          flags | SIGCHLD,
+                          child_req);
 
-            pid_t pid = fork();
+        if (pid < 0) {
+            perror("clone failed");
+            free(child_req);
+            res.status = -1;
+            strcpy(res.message, "clone failed");
+        }
+        else {
+            printf("Started container %s (PID %d)\n",
+                   req.container_id, pid);
 
-            if (pid == 0) {
-                chroot(req.rootfs);
-                chdir("/");
-                execl(req.command, req.command, NULL);
-                perror("exec failed");
-                exit(1);
-            }
-            else if (pid > 0) {
-
-                printf("Started container %s (PID %d)\n",
-                       req.container_id, pid);
-char log_msg[256];
-snprintf(log_msg, sizeof(log_msg),
-         "STARTED container=%s pid=%d",
-         req.container_id, pid);
-
-write_log_to_file(req.container_id, log_msg);
-
-                // store container
-                if (container_count < MAX_CONTAINERS) {
-                    strncpy(containers[container_count].id, req.container_id, sizeof(containers[0].id));
-                    containers[container_count].pid = pid;
-                    container_count++;
-                }
-
-                // ===== PUSH LOG =====
-                log_item_t item;
-                memset(&item, 0, sizeof(item));
-
-                strncpy(item.container_id, req.container_id, sizeof(item.container_id));
-                snprintf(item.data, sizeof(item.data),
-                         "Container %s started with PID %d\n",
-                         req.container_id, pid);
-                item.length = strlen(item.data);
-
-                bounded_buffer_push(&ctx.log_buffer, &item);
-
-                // ===== REGISTER WITH MONITOR =====
-                int monitor_fd = open("/dev/container_monitor", O_RDWR);
-                if (monitor_fd >= 0) {
-                    register_with_monitor(
-                        monitor_fd,
+            // store container
+            if (container_count < MAX_CONTAINERS) {
+                strncpy(containers[container_count].id,
                         req.container_id,
-                        pid,
-                        req.soft_limit_bytes,
-                        req.hard_limit_bytes
-                    );
-                    close(monitor_fd);
-                }
+                        sizeof(containers[0].id));
+                containers[container_count].pid = pid;
+                container_count++;
             }
+
+            // logging
+            char log_msg[256];
+            snprintf(log_msg, sizeof(log_msg),
+                     "STARTED container=%s pid=%d",
+                     req.container_id, pid);
+
+            write_log_to_file(req.container_id, log_msg);
+
+            log_item_t item;
+            memset(&item, 0, sizeof(item));
+            strncpy(item.container_id, req.container_id, sizeof(item.container_id));
+            snprintf(item.data, sizeof(item.data),
+                     "Container %s started with PID %d\n",
+                     req.container_id, pid);
+            item.length = strlen(item.data);
+
+            bounded_buffer_push(&ctx.log_buffer, &item);
+
+            res.status = 0;
+            snprintf(res.message, sizeof(res.message),
+                     "Container %s started (PID %d)",
+                     req.container_id, pid);
         }
-
-        // ===== STOP =====
-        else if (req.kind == CMD_STOP) {
-            for (int i = 0; i < container_count; i++) {
-                if (strcmp(containers[i].id, req.container_id) == 0) {
-pid_t pid = containers[i].pid;
-
-// Step 1: graceful stop
-kill(pid, SIGTERM);
-printf("Sent SIGTERM to %s (PID %d)\n", containers[i].id, pid);
-
-// Step 2: wait
-sleep(2);
-
-// Step 3: force kill if needed
-if (kill(pid, 0) == 0) {
-    printf("Force killing %s (PID %d)\n", containers[i].id, pid);
-    kill(pid, SIGKILL);
-}
-		char log_msg[256];
-snprintf(log_msg, sizeof(log_msg),
-         "STOPPED container=%s pid=%d",
-         containers[i].id,
-         containers[i].pid);
-
-write_log_to_file(containers[i].id, log_msg);
-                    log_item_t item;
-                    snprintf(item.data, sizeof(item.data),
-                             "Container %s stopped\n",
-                             req.container_id);
-                    strncpy(item.container_id, req.container_id, sizeof(item.container_id));
-                    item.length = strlen(item.data);
-
-                    bounded_buffer_push(&ctx.log_buffer, &item);
-
-                    containers[i] = containers[container_count - 1];
-                    container_count--;
-                    break;
-                }
-            }
-        }
-
-        // ===== PS =====
-        else if (req.kind == CMD_PS) {
-            for (int i = 0; i < container_count; i++) {
-printf("\n%-10s %-10s\n", "CONTAINER", "PID");
-printf("----------------------\n");
-
-for (int i = 0; i < container_count; i++) {
-    printf("%-10s %-10d\n",
-           containers[i].id,
-           containers[i].pid);
-}
-            }
-        }
-
-        // ===== LOGS =====
-        else if (req.kind == CMD_LOGS) {
-            char path[256];
-snprintf(path, sizeof(path), "logs/%s.log", req.container_id);
-
-int fd = open(path, O_RDONLY);
-if (fd < 0) {
-    perror("open log file");
-} else {
-    char buf[512];
-    int n;
-
-    while ((n = read(fd, buf, sizeof(buf))) > 0) {
-        write(STDOUT_FILENO, buf, n);
     }
 
-    close(fd);
-}
+    // ===== STOP =====
+    else if (req.kind == CMD_STOP) {
+        int found = 0;
+
+        for (int i = 0; i < container_count; i++) {
+            if (strcmp(containers[i].id, req.container_id) == 0) {
+                pid_t pid = containers[i].pid;
+
+                kill(pid, SIGTERM);
+                sleep(2);
+
+                if (kill(pid, 0) == 0) {
+                    kill(pid, SIGKILL);
+                }
+
+                containers[i] = containers[container_count - 1];
+                container_count--;
+
+                found = 1;
+                break;
+            }
         }
 
-        close(client_fd);
+        if (found) {
+            res.status = 0;
+            snprintf(res.message, sizeof(res.message),
+                     "Container %s stopped", req.container_id);
+        } else {
+            res.status = -1;
+            strcpy(res.message, "Container not found");
+        }
     }
 
+    // ===== PS =====
+    else if (req.kind == CMD_PS) {
+
+        printf("\n%-10s %-10s\n", "CONTAINER", "PID");
+        printf("----------------------\n");
+
+        for (int i = 0; i < container_count; i++) {
+            printf("%-10s %-10d\n",
+                   containers[i].id,
+                   containers[i].pid);
+        }
+
+        res.status = 0;
+        snprintf(res.message, sizeof(res.message),
+                 "Listed %d containers", container_count);
+    }
+
+    // ===== LOGS =====
+    else if (req.kind == CMD_LOGS) {
+
+        char path[256];
+        snprintf(path, sizeof(path), "logs/%s.log", req.container_id);
+
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            res.status = -1;
+            strcpy(res.message, "Log file not found");
+        } else {
+            char buf[512];
+            int n;
+
+            while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                write(STDOUT_FILENO, buf, n);
+            }
+
+            close(fd);
+            res.status = 0;
+            strcpy(res.message, "Logs printed");
+        }
+    }
+
+    // ===== UNKNOWN =====
+    else {
+        res.status = -1;
+        strcpy(res.message, "Unknown command");
+    }
+
+    // ✅ SEND RESPONSE BACK
+    write(client_fd, &res, sizeof(res));
+
+    close(client_fd);
+}
     // ===== CLEANUP (never reached but must be inside function) =====
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
@@ -615,6 +650,7 @@ static int send_control_request(const control_request_t *req)
 {
     int fd;
     struct sockaddr_un addr;
+    control_response_t res;
 
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -636,6 +672,13 @@ static int send_control_request(const control_request_t *req)
         perror("write");
         close(fd);
         return 1;
+    }
+
+    // ✅ READ RESPONSE FROM SERVER
+    if (read(fd, &res, sizeof(res)) > 0) {
+        printf("[SERVER]: %s\n", res.message);
+    } else {
+        printf("[SERVER]: No response received\n");
     }
 
     close(fd);
