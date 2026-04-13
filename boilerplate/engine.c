@@ -381,7 +381,7 @@ int child_fn(void *arg)
 {
     control_request_t *req = (control_request_t *)arg;
 
-    printf("👶 Container started (PID namespace)\n");
+    printf(" Container started (PID namespace)\n");
 
     // 🔹 Hostname isolation
     sethostname(req->container_id, strlen(req->container_id));
@@ -626,7 +626,7 @@ while (1) {
         strcpy(res.message, "Unknown command");
     }
 
-    // ✅ SEND RESPONSE BACK
+    //  SEND RESPONSE BACK
     write(client_fd, &res, sizeof(res));
 
     close(client_fd);
@@ -674,7 +674,7 @@ static int send_control_request(const control_request_t *req)
         return 1;
     }
 
-    // ✅ READ RESPONSE FROM SERVER
+    //  READ RESPONSE FROM SERVER
     if (read(fd, &res, sizeof(res)) > 0) {
         printf("[SERVER]: %s\n", res.message);
     } else {
