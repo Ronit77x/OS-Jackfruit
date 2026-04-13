@@ -392,6 +392,11 @@ int child_fn(void *arg)
         exit(1);
     }
     chdir("/");
+    mkdir("/proc", 0555);
+
+if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+    perror("mount /proc failed");
+}
 
     // 🔹 Execute command
     execl(req->command, req->command, NULL);
